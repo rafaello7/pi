@@ -5,8 +5,10 @@
 #include <unistd.h>
 #include <stdint.h>
 
-/* desired PI precision in thousands of digits */
-static int gDigThPrec;
+#define OVFL_CNT 16
+
+/* desired PI precision in digits */
+static unsigned gDigPrec;
 
 /* calculation precision in 4-byte words */
 static unsigned gWordPrec;
@@ -18,18 +20,18 @@ static unsigned gInProgressCount;
 static unsigned gNextComp;
 static unsigned gCompCount;
 static unsigned gProgressStep, gNextProgress;
-static unsigned gProdPipeCount;
 
 /* To print PI, the calculated value is multiplied several times by 1e9.
  * Products are computed piecewise. Each thread calculates own piece.
  * Overflow value is transferred to next thread.
  */
 struct ProdPipeline {
-	pthread_t thread;
 	struct ProdPipeline *prev;
 	unsigned first, prec;		// PI piece to multiply
-	uint32_t overflows[2];
-	int overflowCount;
+	uint32_t overflows[OVFL_CNT];
+	unsigned ovflGetIdx;
+	unsigned ovflPutIdx;
+	unsigned ovflCount;
 };
 
 /* Adds to sum i-th component of Pi
@@ -40,7 +42,7 @@ struct ProdPipeline {
  */
 static void calc_pi_component(uint32_t *sum, unsigned i)
 {
-	int firstnz, curnz, p2, j, sumOvl, loc;
+	int firstnz, p2, j, sumOvl, loc;
 	uint32_t dig, dig0, remainders[7], div[7];
 	uint64_t dividend, resSum;
 
@@ -58,24 +60,35 @@ static void calc_pi_component(uint32_t *sum, unsigned i)
 	div[5] = 640 * i + 320;
 	div[6] = 640 * i + 448;
 
-	for(curnz = firstnz; curnz < gWordPrec; ++curnz) {
-		resSum = sum[curnz];
+	resSum = sum[firstnz];
+	for(j = 0; j < 7; ++j) {
+		if( (i&1) == (j<2) ) {	// dividend is negative
+			dividend = ((uint64_t)div[j] << 32) - dig0;
+			resSum -= 1LL << 32;
+		}else
+			dividend = dig0;
+		dig = dividend / div[j];
+		remainders[j] = dividend - dig * div[j];
+		resSum += dig;
+	}
+	sum[firstnz] = resSum;
+	sumOvl = (int32_t)(resSum>>32);
+	for(loc = firstnz - 1; sumOvl && loc >= 0; --loc ) {
+		resSum = (int64_t)sum[loc] + sumOvl;
+		sum[loc] = resSum;
+		sumOvl = (int32_t)(resSum>>32);
+	}
+	while(++firstnz < gWordPrec) {
+		resSum = sum[firstnz];
 		for(j = 0; j < 7; ++j) {
-			if( curnz == firstnz ) {
-				if( (i&1) == (j<2) ) {	// dividend is negative
-					dividend = ((uint64_t)div[j] << 32) - dig0;
-					resSum -= 1LL << 32;
-				}else
-					dividend = dig0;
-			}else
-				dividend = ((uint64_t)remainders[j] << 32);
+			dividend = (uint64_t)remainders[j] << 32;
 			dig = dividend / div[j];
 			remainders[j] = dividend - dig * div[j];
 			resSum += dig;
 		}
-		sum[curnz] = resSum;
+		sum[firstnz] = resSum;
 		sumOvl = (int32_t)(resSum>>32);
-		for(loc = curnz - 1; sumOvl && loc >= 0; --loc ) {
+		for(loc = firstnz - 1; sumOvl && loc >= 0; --loc ) {
 			resSum = (int64_t)sum[loc] + sumOvl;
 			sum[loc] = resSum;
 			sumOvl = (int32_t)(resSum>>32);
@@ -89,7 +102,7 @@ void *threadFun(void *arg)
 	uint32_t *pi_part, overflow;
 	uint64_t sum;
 	unsigned num;
-	int idx;
+	int idx, digitsRemain;
 
 	pi_part = calloc(gWordPrec, sizeof(uint32_t));
 	while( 1 ) {
@@ -122,16 +135,17 @@ void *threadFun(void *arg)
 	}
 	free(pi_part);
 
-	for(num = 0; num < gProdPipeCount; ++num) {
+	for(digitsRemain = gDigPrec; digitsRemain >= 0; digitsRemain -= 9) {
 		if( pp->prev ) {
 			int isReady = 0;
 			while( ! isReady ) {
 				pthread_mutex_lock(&gMutex);
-				isReady = pp->prev->overflowCount > 0;
+				isReady = pp->prev->ovflCount > 0;
 				if( isReady ) {
-					overflow = pp->prev->overflows[0];
-					if( --pp->prev->overflowCount )
-						pp->prev->overflows[0] = pp->prev->overflows[1];
+					overflow = pp->prev->overflows[pp->prev->ovflGetIdx];
+					if( ++pp->prev->ovflGetIdx == OVFL_CNT )
+						pp->prev->ovflGetIdx = 0;
+					--pp->prev->ovflCount;
 				}
 				pthread_mutex_unlock(&gMutex);
 			}
@@ -142,25 +156,26 @@ void *threadFun(void *arg)
 			pi[idx] = sum = 1000000000ULL * pi[idx] + (sum >> 32);
 		overflow = sum >> 32;
 		if( pp->first == 1 ) {
-			if( num == 0 )
+			if( digitsRemain == gDigPrec )
 				printf("%u.", pi[0]);
-			if( num < gProdPipeCount - 1 )
+			if( digitsRemain > 9 ) {
 				printf("%09u", overflow);
-			else{
-			   	if( (gDigThPrec * 1000) % 9 ) {
-					char buf[10];
-					sprintf(buf, "%09u", overflow);
-					printf("%.*s", (gDigThPrec * 1000) % 9, buf);
-				}
-				printf("\n");
+			}else{
+				char buf[12];
+				sprintf(buf, "%09u", overflow);
+				printf("%.*s\n", digitsRemain, buf);
 			}
 		}else{
 			int isReady = 0;
 			while( ! isReady ) {
 				pthread_mutex_lock(&gMutex);
-				isReady = pp->overflowCount < 2;
-				if( isReady )
-					pp->overflows[pp->overflowCount++] = overflow;
+				isReady = pp->ovflCount < OVFL_CNT;
+				if( isReady ) {
+					pp->overflows[pp->ovflPutIdx] = overflow;
+					if( ++pp->ovflPutIdx == OVFL_CNT )
+						pp->ovflPutIdx = 0;
+					++pp->ovflCount;
+				}
 				pthread_mutex_unlock(&gMutex);
 			}
 		}
@@ -170,21 +185,24 @@ void *threadFun(void *arg)
 
 int main(int argc, char *argv[])
 {
+	pthread_t *threads;
 	struct ProdPipeline *pp;
 	struct timeval tm_beg, tm_end, tm_diff;
-	int i, cpuCount;
+	int i;
+	unsigned threadCount;
 
 	if( argc == 1 ) {
 		fprintf(stderr, "usage:\n");
-		fprintf(stderr, "      pi <thousands of digits>\n\n");
+		fprintf(stderr, "	   pi <thousands of digits>\n\n");
 		return 0;
 	}
-	gDigThPrec = atoi(argv[1]);
-	if( gDigThPrec < 1 || gDigThPrec > 10000 ) {
+	gDigPrec = 1000 * atoi(argv[1]);
+	if( gDigPrec < 1 || gDigPrec > 10000000 ) {
 		fprintf(stderr, "  argument out of range\n");
 		return 1;
 	}
-	gWordPrec = 104 * gDigThPrec + 2;
+	// 104/1000 ~= 1/log(2^32)
+	gWordPrec = gDigPrec * 104 / 1000 + 2;
 	gCompCount = (32 * gWordPrec + 11) / 10;
 	// expression: 2560 * gCompCount + 2304 cannot exceed UINT_MAX
 	if( gCompCount > 1677721 ) {
@@ -196,23 +214,30 @@ int main(int argc, char *argv[])
 	pthread_cond_init(&gCond, NULL);
 	gProgressStep = gCompCount / 81;
 	gNextProgress = gCompCount - 80 * gProgressStep + 1;
-	cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
-	pp = malloc(cpuCount * sizeof(struct ProdPipeline));
+	threadCount = sysconf(_SC_NPROCESSORS_ONLN);
+	if( threadCount >= gWordPrec )
+		threadCount = gWordPrec - 1;
+	pp = malloc(threadCount * sizeof(struct ProdPipeline));
 	pi = calloc(gWordPrec, sizeof(uint32_t));
-	gInProgressCount = cpuCount;
-	gProdPipeCount = gDigThPrec * 1000 / 9 + 1;
-	for(i = 0; i < cpuCount; ++i) {
-		pp[i].first = 1 + (i * (gWordPrec-1)) / cpuCount;
-		pp[i].prec = ((i+1) * (gWordPrec-1)) / cpuCount -
-			(i*(gWordPrec-1)) / cpuCount;
-		pp[i].prev = i == cpuCount - 1 ? NULL : pp + i + 1;
-		pp[i].overflowCount = 0;
-		pthread_create(&pp[i].thread, NULL, threadFun, pp + i);
+	threads = malloc((threadCount-1) * sizeof(pthread_t));
+	gInProgressCount = threadCount;
+	for(i = 0; i < threadCount; ++i) {
+		pp[i].first = 1 + (i * (gWordPrec-1)) / threadCount;
+		pp[i].prec = ((i+1) * (gWordPrec-1)) / threadCount -
+			(i*(gWordPrec-1)) / threadCount;
+		pp[i].prev = i == threadCount - 1 ? NULL : pp + i + 1;
+		pp[i].ovflGetIdx = 0;
+		pp[i].ovflPutIdx = 0;
+		pp[i].ovflCount = 0;
 	}
-	for(i = 0; i < cpuCount; ++i)
-		pthread_join(pp[i].thread, NULL);
+	for(i = 1; i < threadCount; ++i)
+		pthread_create(threads + i - 1, NULL, threadFun, pp + i);
+	threadFun(pp);
+	for(i = 1; i < threadCount; ++i)
+		pthread_join(threads[i-1], NULL);
 	free(pp);
 	free(pi);
+	free(threads);
 	gettimeofday(&tm_end, NULL);
 	timersub(&tm_end, &tm_beg, &tm_diff);
 	fprintf(stderr, "exec time: ");
