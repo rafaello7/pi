@@ -14,9 +14,7 @@ static unsigned gDigPrec;
 static unsigned gWordPrec;
 
 static pthread_mutex_t gMutex;
-static pthread_cond_t gCond;
 static uint32_t *pi;
-static unsigned gInProgressCount;
 static unsigned gNextComp;
 static unsigned gCompCount;
 static unsigned gProgressStep, gNextProgress;
@@ -26,7 +24,7 @@ static unsigned gProgressStep, gNextProgress;
  * Overflow value is transferred to next thread.
  */
 struct ProdPipeline {
-	struct ProdPipeline *prev;
+	struct ProdPipeline *prev;	// to get previous PI piece overflow
 	unsigned first, prec;		// PI piece to multiply
 	uint32_t overflows[OVFL_CNT];
 	unsigned ovflGetIdx;
@@ -96,13 +94,12 @@ static void calc_pi_component(uint32_t *sum, unsigned i)
 	}
 }
 
-void *threadFun(void *arg)
+static void *piPartWorker(void *arg)
 {
-	struct ProdPipeline *pp = arg;
-	uint32_t *pi_part, overflow;
+	uint32_t *pi_part;
 	uint64_t sum;
 	unsigned num;
-	int idx, digitsRemain;
+	int idx;
 
 	pi_part = calloc(gWordPrec, sizeof(uint32_t));
 	while( 1 ) {
@@ -112,20 +109,6 @@ void *threadFun(void *arg)
 			if( ++gNextComp >= gNextProgress ) {
 				fputc('.', stderr);
 				gNextProgress += gProgressStep;
-				if( gNextProgress >= gCompCount )
-					fputc('\n', stderr);
-			}
-		}else{
-			// pi += pi_part
-			sum = 0;
-			for(idx = gWordPrec - 1; idx >= 0; --idx)
-				pi[idx] = sum = (sum >> 32) + pi[idx] + pi_part[idx];
-			// wait until pi is calculated
-			if( --gInProgressCount == 0 )
-				pthread_cond_broadcast(&gCond);
-			else{
-				while( gInProgressCount )
-					pthread_cond_wait(&gCond, &gMutex);
 			}
 		}
 		pthread_mutex_unlock(&gMutex);
@@ -133,7 +116,22 @@ void *threadFun(void *arg)
 			break;
 		calc_pi_component(pi_part, num);
 	}
+	pthread_mutex_lock(&gMutex);
+	// pi += pi_part
+	sum = 0;
+	for(idx = gWordPrec - 1; idx >= 0; --idx)
+		pi[idx] = sum = (sum >> 32) + pi[idx] + pi_part[idx];
+	pthread_mutex_unlock(&gMutex);
 	free(pi_part);
+	return NULL;
+}
+
+static void *printPiWorker(void *arg)
+{
+	struct ProdPipeline *pp = arg;
+	uint32_t overflow;
+	uint64_t sum;
+	int idx, digitsRemain;
 
 	for(digitsRemain = gDigPrec; digitsRemain >= 0; digitsRemain -= 9) {
 		if( pp->prev ) {
@@ -156,8 +154,6 @@ void *threadFun(void *arg)
 			pi[idx] = sum = 1000000000ULL * pi[idx] + (sum >> 32);
 		overflow = sum >> 32;
 		if( pp->first == 1 ) {
-			if( digitsRemain == gDigPrec )
-				printf("%u.", pi[0]);
 			if( digitsRemain > 9 ) {
 				printf("%09u", overflow);
 			}else{
@@ -188,12 +184,11 @@ int main(int argc, char *argv[])
 	pthread_t *threads;
 	struct ProdPipeline *pp;
 	struct timeval tm_beg, tm_end, tm_diff;
-	int i;
-	unsigned threadCount;
+	unsigned i, threadCount;
 
 	if( argc == 1 ) {
 		fprintf(stderr, "usage:\n");
-		fprintf(stderr, "	   pi <thousands of digits>\n\n");
+		fprintf(stderr, "   pi <thousands of digits>\n\n");
 		return 0;
 	}
 	gDigPrec = 1000 * atoi(argv[1]);
@@ -211,7 +206,6 @@ int main(int argc, char *argv[])
 	}
 	gettimeofday(&tm_beg, NULL);
 	pthread_mutex_init(&gMutex, NULL);
-	pthread_cond_init(&gCond, NULL);
 	gProgressStep = gCompCount / 81;
 	gNextProgress = gCompCount - 80 * gProgressStep + 1;
 	threadCount = sysconf(_SC_NPROCESSORS_ONLN);
@@ -220,7 +214,12 @@ int main(int argc, char *argv[])
 	pp = malloc(threadCount * sizeof(struct ProdPipeline));
 	pi = calloc(gWordPrec, sizeof(uint32_t));
 	threads = malloc((threadCount-1) * sizeof(pthread_t));
-	gInProgressCount = threadCount;
+	for(i = 1; i < threadCount; ++i)
+		pthread_create(threads + i - 1, NULL, piPartWorker, NULL);
+	piPartWorker(pp);
+	for(i = 1; i < threadCount; ++i)
+		pthread_join(threads[i-1], NULL);
+	fprintf(stderr, "\n");
 	for(i = 0; i < threadCount; ++i) {
 		pp[i].first = 1 + (i * (gWordPrec-1)) / threadCount;
 		pp[i].prec = ((i+1) * (gWordPrec-1)) / threadCount -
@@ -231,8 +230,9 @@ int main(int argc, char *argv[])
 		pp[i].ovflCount = 0;
 	}
 	for(i = 1; i < threadCount; ++i)
-		pthread_create(threads + i - 1, NULL, threadFun, pp + i);
-	threadFun(pp);
+		pthread_create(threads + i - 1, NULL, printPiWorker, pp + i);
+	printf("%u.", pi[0]);
+	printPiWorker(pp);
 	for(i = 1; i < threadCount; ++i)
 		pthread_join(threads[i-1], NULL);
 	free(pp);
@@ -240,13 +240,8 @@ int main(int argc, char *argv[])
 	free(threads);
 	gettimeofday(&tm_end, NULL);
 	timersub(&tm_end, &tm_beg, &tm_diff);
-	fprintf(stderr, "exec time: ");
-	if( tm_diff.tv_sec >= 60 ) {
-		fprintf(stderr, "%ld min  %ld s\n",
-				tm_diff.tv_sec / 60, tm_diff.tv_sec % 60);
-	}else
-		fprintf(stderr, "%.3f s\n",
-				tm_diff.tv_sec + (tm_diff.tv_usec/1000000.0));
+	fprintf(stderr, "exec time: %.3f s\n",
+			tm_diff.tv_sec + (tm_diff.tv_usec/1000000.0));
 	return 0;
 }
 
