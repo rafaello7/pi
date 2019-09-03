@@ -184,14 +184,26 @@ int main(int argc, char *argv[])
 	pthread_t *threads;
 	struct ProdPipeline *pp;
 	struct timeval tm_beg, tm_end, tm_diff;
-	unsigned i, threadCount;
+	unsigned i, threadCount, argno;
+	int isSingleThreaded = 0, isPrintingSingle = 0;
 
-	if( argc == 1 ) {
+	for(argno = 1; argno < argc && argv[argno][0] == '-'; ++argno) {
+		for(i = 1; argv[argno][i]; ++i) {
+			if( argv[argno][i] == '1' )
+				isSingleThreaded = 1;
+			else if( argv[argno][i] == 'P' )
+				isPrintingSingle = 1;
+		}
+	}
+	if( argno == argc ) {
 		fprintf(stderr, "usage:\n");
-		fprintf(stderr, "   pi <thousands of digits>\n\n");
+		fprintf(stderr, "   pi [-1] [-P] <thousands of digits>\n\n");
+		fprintf(stderr, "options:\n");
+		fprintf(stderr, "   -1		- single threaded\n");
+		fprintf(stderr, "   -P		- print using one thread\n\n");
 		return 0;
 	}
-	gDigPrec = 1000 * atoi(argv[1]);
+	gDigPrec = 1000 * atoi(argv[argno]);
 	if( gDigPrec < 1 || gDigPrec > 10000000 ) {
 		fprintf(stderr, "  argument out of range\n");
 		return 1;
@@ -208,7 +220,7 @@ int main(int argc, char *argv[])
 	pthread_mutex_init(&gMutex, NULL);
 	gProgressStep = gCompCount / 81;
 	gNextProgress = gCompCount - 80 * gProgressStep + 1;
-	threadCount = sysconf(_SC_NPROCESSORS_ONLN);
+	threadCount = isSingleThreaded ? 1 : sysconf(_SC_NPROCESSORS_ONLN);
 	if( threadCount >= gWordPrec )
 		threadCount = gWordPrec - 1;
 	pp = malloc(threadCount * sizeof(struct ProdPipeline));
@@ -220,6 +232,8 @@ int main(int argc, char *argv[])
 	for(i = 1; i < threadCount; ++i)
 		pthread_join(threads[i-1], NULL);
 	fprintf(stderr, "\n");
+	if( isPrintingSingle )
+		threadCount = 1;
 	for(i = 0; i < threadCount; ++i) {
 		pp[i].first = 1 + (i * (gWordPrec-1)) / threadCount;
 		pp[i].prec = ((i+1) * (gWordPrec-1)) / threadCount -
